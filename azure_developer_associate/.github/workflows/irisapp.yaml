@@ -1,0 +1,143 @@
+
+name: Iris App CI/CD
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'irisapp/trigger.txt'
+  workflow_dispatch:
+env:
+  RESOURCE_GROUP_NAME: "irisapp-rg"
+  STORAGE_ACCOUNT_NAME: "irisappstoragegs"
+  STORAGE_CONTAINER_NAME: "irisapp-containergs"
+  COSMOS_DB_ACCOUNT_NAME: "irisappcosmosdbgs"
+  CONTAINER_APP_NAME: "irisappgs"
+  CONTAINER_APP_ENV_NAME: "irisapp-env"
+  REGISTRY_SERVER: "https://docker.io"
+  REGISTRY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  REGISTRY_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
+  LOCATION: "brazilsouth"
+  IMAGE_NAME: "gilsama/irisapp:latest"
+
+jobs:
+  create_azure_resources:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create Resource Group
+        run: |
+          az group create --name ${{ env.RESOURCE_GROUP_NAME }} --location ${{ env.LOCATION }}
+
+  create_storage_resources:
+    runs-on: ubuntu-latest
+    needs: create_azure_resources
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create Storage Account
+        run: |
+          # Check if the storage account already exists
+          existing_storage=$(az storage account list --resource-group ${{ env.RESOURCE_GROUP_NAME }} --query "[?name=='${{ env.STORAGE_ACCOUNT_NAME }}'].name" -o tsv)
+          if [ -n "$existing_storage" ]; then
+            echo "Storage account ${{ env.STORAGE_ACCOUNT_NAME }} already exists."
+          else
+            echo "Creating storage account: ${{ env.STORAGE_ACCOUNT_NAME }}"
+            az storage account create \
+              --name ${{ env.STORAGE_ACCOUNT_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+              --location ${{ env.LOCATION }} \
+              --sku Standard_LRS
+          fi
+    
+      - name: Create Cosmos DB Account 
+        run: |
+          # list existing Cosmos DB accounts
+          existing_cosmosdb=$(az cosmosdb list --resource-group ${{ env.RESOURCE_GROUP_NAME }} --query "[?name=='${{ env.COSMOS_DB_ACCOUNT_NAME }}'].name" -o tsv)
+          if [ -z "$existing_cosmosdb" ]; then
+            echo "Creating Cosmos DB account: ${{ env.COSMOS_DB_ACCOUNT_NAME }}"
+            az cosmosdb create \
+              --name ${{ env.COSMOS_DB_ACCOUNT_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP_NAME }} 
+          else
+            echo "Cosmos DB account ${{ env.COSMOS_DB_ACCOUNT_NAME }} already exists."
+          fi
+
+  build_and_push_container:
+    runs-on: ubuntu-latest
+    needs: create_storage_resources
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@9ec57ed1fcdbf14dcef7dfbe97b2010124a938b7
+        with:
+          images: gilsama/irisapp
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671
+        with:
+          context: ./irisapp/
+          push: true
+          tags: gilsama/irisapp:latest
+          labels: ${{ steps.meta.outputs.labels }}          
+
+
+  create_azure_web_app:
+    env:
+      SERVICE_PLAN_NAME: "irisapp-service-plan"
+    runs-on: ubuntu-latest
+    needs: [create_azure_resources, build_and_push_container]
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create Service plan
+        run: |
+          # Check if the service plan already exists
+          existing_plan=$(az appservice plan list --resource-group ${{ env.RESOURCE_GROUP_NAME }} --query "[?name=='${{ env.SERVICE_PLAN_NAME }}'].name" -o tsv)
+          if [ -n "$existing_plan" ]; then
+            echo "Service plan ${{ env.SERVICE_PLAN_NAME }} already exists."
+          else
+            echo "Creating service plan: ${{ env.SERVICE_PLAN_NAME }}"
+            az appservice plan create --name ${{ env.SERVICE_PLAN_NAME }} --resource-group ${{ env.RESOURCE_GROUP_NAME }} --sku B1 --is-linux
+          fi
+
+      - name: Create Web App
+        run: |
+          # Check if the web app already exists
+          existing_webapp=$(az webapp list --resource-group ${{ env.RESOURCE_GROUP_NAME }} --query "[?name=='${{ env.CONTAINER_APP_NAME }}'].name" -o tsv)
+          if [ -n "$existing_webapp" ]; then
+            echo "Web app ${{ env.CONTAINER_APP_NAME }} already exists."
+          else
+            echo "Creating web app: ${{ env.CONTAINER_APP_NAME }}"
+            az webapp create \
+              --name ${{ env.CONTAINER_APP_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+              --plan ${{ env.SERVICE_PLAN_NAME }} \
+              --container-image-name ${{ env.IMAGE_NAME }} \
+              --container-registry-user ${{ secrets.DOCKER_USERNAME }} \
+              --container-registry-password ${{ secrets.DOCKER_PASSWORD }} \
+              --container-registry-url ${{ env.REGISTRY_SERVER }}
+          fi

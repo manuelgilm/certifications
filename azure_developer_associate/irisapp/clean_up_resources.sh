@@ -1,0 +1,1 @@
+az group delete --name irisapp-rg --yes --no-wait

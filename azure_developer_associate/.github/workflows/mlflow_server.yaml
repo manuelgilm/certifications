@@ -1,0 +1,300 @@
+
+name: MLflow Server Deploy
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'mlflow_server/trigger.txt'
+  workflow_dispatch:
+env:
+  RESOURCE_GROUP_NAME: "mlflowserver_rg"
+  STORAGE_ACCOUNT_NAME: "mlflowserverstrggs"
+  BLOB_CONTAINER_NAME: "mlflow-artifacts"
+  AZURE_CONTAINER_REGISTRY_NAME: "mlflowacrgs"
+  AZURE_POSTGRESQL_NAME: "mlflowserverpsqlgs"
+  DATABASE_NAME: "mlflowdb"
+  COSMOS_DB_ACCOUNT_NAME: "mlflow_serverosmosdbgs"
+  CONTAINER_APP_NAME: "mlflowserver"
+  CONTAINER_APP_ENV_NAME: "mlflowserverenv"
+  LOCATION: "brazilsouth"
+  IMAGE_NAME: "gilsama/mlflow_server"
+
+jobs:
+  create_azure_resources:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create Resource Group
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            # Check if the resource group already exists
+            existing_rg=$(az group exists --name ${{ env.RESOURCE_GROUP_NAME }})
+            if [ "$existing_rg" = "false" ]; then
+              echo "Creating resource group: ${{ env.RESOURCE_GROUP_NAME }}"
+              az group create --name ${{ env.RESOURCE_GROUP_NAME }} --location ${{ env.LOCATION }}
+            else
+              echo "Resource group ${{ env.RESOURCE_GROUP_NAME }} already exists."
+            fi
+
+      - name: Create Storage Account
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            # Check if the storage account already exists
+            existing_storage=$(az storage account list --resource-group ${{ env.RESOURCE_GROUP_NAME }} --query "[?name=='${{ env.STORAGE_ACCOUNT_NAME }}'].name" -o tsv)
+            if [ -n "$existing_storage" ]; then
+              echo "Storage account ${{ env.STORAGE_ACCOUNT_NAME }} already exists."
+            else
+              echo "Creating storage account: ${{ env.STORAGE_ACCOUNT_NAME }}"
+              az storage account create \
+                --name ${{ env.STORAGE_ACCOUNT_NAME }} \
+                --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+                --location ${{ env.LOCATION }} \
+                --sku Standard_LRS
+            fi
+      - name: Get Storage Account Connection String
+        id: get_storage_connection_string
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            connection_string=$(az storage account show-connection-string --name ${{ env.STORAGE_ACCOUNT_NAME }} --resource-group ${{ env.RESOURCE_GROUP_NAME }} --query connectionString -o tsv)
+            account_key=$(az storage account keys list --account-name ${{ env.STORAGE_ACCOUNT_NAME }} --resource-group ${{ env.RESOURCE_GROUP_NAME }} --query '[0].value' -o tsv)
+            echo "AZURE_STORAGE_CONNECTION_STRING=$connection_string" >> $GITHUB_OUTPUT
+            echo "AZURE_STORAGE_ACCESS_KEY=$account_key" >> $GITHUB_OUTPUT
+
+      - name: Create a Blob Container
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            # Check if the blob container already exists
+            existing_container=$(az storage container list --account-name ${{ env.STORAGE_ACCOUNT_NAME }} --query "[?name=='mlflow-artifacts'].name" -o tsv)
+            if [ -n "$existing_container" ]; then
+              echo "Blob container '${{ env.BLOB_CONTAINER_NAME }}' already exists."
+            else
+              echo "Creating blob container: ${{ env.BLOB_CONTAINER_NAME }}"
+              az storage container create \
+                --name ${{ env.BLOB_CONTAINER_NAME }} \
+                --account-name ${{ env.STORAGE_ACCOUNT_NAME }} \
+                --connection-string "${{ steps.get_storage_connection_string.outputs.connection_string }}" \
+                --public-access off
+            fi
+
+      - name: Create a PostgreSQL Server
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            # Check if the PostgreSQL server already exists
+            existing_pg=$(
+            az postgres flexible-server list \
+            --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+            --query "[?name=='${{ env.AZURE_POSTGRESQL_NAME }}'].name" -o tsv
+            )
+            if [ -n "$existing_pg" ]; then
+              echo "PostgreSQL server ${{ env.AZURE_POSTGRESQL_NAME }} already exists."
+            else
+              echo "Creating PostgreSQL server: ${{ env.AZURE_POSTGRESQL_NAME }}"
+              az postgres flexible-server create \
+              --name ${{ env.AZURE_POSTGRESQL_NAME }} \
+              --admin-display-name ${{ secrets.AZ_SP_CLIENT_ID }} \
+              --admin-type ServicePrincipal \
+              --admin-object-id ${{ secrets.AZ_SP_CLIENT_ID }} \
+              --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+              --location ${{ env.LOCATION }} \
+              --sku-name Standard_B1ms \
+              --version 14 \
+              --tier Burstable \
+              --microsoft-entra-auth Enabled \
+              --admin-type User \
+              --admin-password ${{ secrets.AZ_POSTGRESQL_DB_ADMIN_PASSWORD }} \
+              --admin-user ${{ secrets.AZ_POSTGRESQL_DB_ADMIN_USERNAME }} \
+              --yes
+            fi
+
+            # Monitor status of the server with a timeout of 10 minutes
+            echo "Monitoring PostgreSQL server status for up to 10 minutes..."
+            max_wait_seconds=600
+            wait_interval=15
+            elapsed=0
+            while true; do
+              server_status=$(
+                az postgres flexible-server show \
+                  --name ${{ env.AZURE_POSTGRESQL_NAME }} \
+                  --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+                  --query "state" -o tsv
+                )
+              if [ "$server_status" = "Ready" ]; then
+              echo "PostgreSQL server ${{ env.AZURE_POSTGRESQL_NAME }} is running."
+              break
+              fi
+              if [ "$elapsed" -ge "$max_wait_seconds" ]; then
+              echo "Timeout reached: PostgreSQL server ${{ env.AZURE_POSTGRESQL_NAME }} is not running after 10 minutes."
+              break
+              fi
+              echo "Current status: $server_status. Waiting for server to be ready..."
+              sleep $wait_interval
+              elapsed=$((elapsed + wait_interval))
+            done
+
+      - name: Create a PostgreSQL database
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            # Check if the database already exists
+            existing_db=$(
+            az postgres flexible-server db list \
+              --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+              --server-name ${{ env.AZURE_POSTGRESQL_NAME }} \
+              --query "[?name=='${{ env.DATABASE_NAME }}'].name" -o tsv
+            )
+            if [ -n "$existing_db" ]; then
+              echo "Database ${{ env.DATABASE_NAME }} already exists."
+            else
+              echo "Creating database: ${{ env.DATABASE_NAME }}"
+              az postgres flexible-server db create \
+              --database-name ${{ env.DATABASE_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+              --server-name ${{ env.AZURE_POSTGRESQL_NAME }}
+            fi
+
+      - name: Create Azure Container Registry
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            # Check if the ACR already exists
+            existing_acr=$(
+              az acr list \
+              --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+              --query "[?name=='${{ env.AZURE_CONTAINER_REGISTRY_NAME }}'].name" -o tsv
+            )
+            if [ -n "$existing_acr" ]; then
+              echo "Azure Container Registry ${{ env.AZURE_CONTAINER_REGISTRY_NAME }} already exists."
+            else
+              echo "Creating Azure Container Registry: ${{ env.AZURE_CONTAINER_REGISTRY_NAME }}"
+              az acr create \
+                --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+                --name ${{ env.AZURE_CONTAINER_REGISTRY_NAME }} \
+                --sku Basic \
+                --admin-enabled true
+            fi
+    outputs:
+      AZURE_STORAGE_CONNECTION_STRING: ${{ steps.get_storage_connection_string.outputs.AZURE_STORAGE_CONNECTION_STRING }}
+      AZURE_STORAGE_ACCESS_KEY: ${{ steps.get_storage_connection_string.outputs.AZURE_STORAGE_ACCESS_KEY }}
+
+  deploy_mlflow_image:
+    runs-on: ubuntu-latest
+    needs: create_azure_resources
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Build the image using ACR Tasks
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az acr build \
+              --registry ${{ env.AZURE_CONTAINER_REGISTRY_NAME }} \
+              --image ${{ env.IMAGE_NAME }}:${{ github.sha }} ./mlflow_server \
+              --secret-build-arg POSTGRESQL_DB_ADMIN_USERNAME=${{ secrets.AZ_POSTGRESQL_DB_ADMIN_USERNAME }} \
+              --secret-build-arg POSTGRESQL_DB_ADMIN_PASSWORD=${{ secrets.AZ_POSTGRESQL_DB_ADMIN_PASSWORD }} \
+              --secret-build-arg POSTGRESQL_DB_NAME=${{ env.DATABASE_NAME }} \
+              --secret-build-arg POSTGRESQL_SERVER=${{ env.AZURE_POSTGRESQL_NAME }}.postgres.database.azure.com 
+  
+  create_azure_web_app:
+    runs-on: ubuntu-latest
+    env:
+      AZURE_STORAGE_CONNECTION_STRING: ${{ needs.create_azure_resources.outputs.AZURE_STORAGE_CONNECTION_STRING }}
+      AZURE_STORAGE_ACCESS_KEY: ${{ needs.create_azure_resources.outputs.STORAGE_ACCOUNT_KEY }}
+    needs: 
+      - deploy_mlflow_image
+      - create_azure_resources
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create Container App Environment
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            # Check if the Container App Environment already exists
+            existing_env=$(
+              az containerapp env list \
+              --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+              --query "[?name=='${{ env.CONTAINER_APP_ENV_NAME }}'].name" -o tsv
+            )
+            if [ -n "$existing_env" ]; then
+              echo "Container App Environment ${{ env.CONTAINER_APP_ENV_NAME }} already exists."
+            else
+              echo "Creating Container App Environment: ${{ env.CONTAINER_APP_ENV_NAME }}"
+              az containerapp env create \
+                --name ${{ env.CONTAINER_APP_ENV_NAME }} \
+                --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+                --location ${{ env.LOCATION }}
+            fi
+
+      - name: Get Azure Container Registry Password
+        id: get_acr_password
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            echo "::set-output name=acr_password::$(az acr credential show --name ${{ env.AZURE_CONTAINER_REGISTRY_NAME }} --query "passwords[0].value" -o tsv)"
+
+      - name: Create Container App
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            # Check if the Container App already exists
+            existing_app=$(
+              az containerapp list \
+              --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+              --query "[?name=='${{ env.CONTAINER_APP_NAME }}'].name" -o tsv
+            )
+              
+            if [ -n "$existing_app" ]; then
+              echo "Container App ${{ env.CONTAINER_APP_NAME }} already exists."
+            else
+              echo "Creating Container App: ${{ env.CONTAINER_APP_NAME }}"
+              az containerapp create \
+                --name ${{ env.CONTAINER_APP_NAME }} \
+                --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+                --environment ${{ env.CONTAINER_APP_ENV_NAME }} \
+                --image ${{ env.AZURE_CONTAINER_REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+                --cpu 1 \
+                --memory 2Gi \
+                --registry-server ${{ env.AZURE_CONTAINER_REGISTRY_NAME }}.azurecr.io \
+                --registry-username ${{ env.AZURE_CONTAINER_REGISTRY_NAME }} \
+                --registry-password ${{ steps.get_acr_password.outputs.acr_password }} \
+                --ingress external \
+                --target-port 5000 \
+                --env-vars AZURE_STORAGE_CONNECTION_STRING=$AZURE_STORAGE_CONNECTION_STRING \
+                AZURE_STORAGE_ACCESS_KEY=$AZURE_STORAGE_ACCESS_KEY
+            fi

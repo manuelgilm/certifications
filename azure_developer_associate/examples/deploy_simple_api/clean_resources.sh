@@ -1,0 +1,1 @@
+az group delete --name SimpleApiRG --yes --no-wait
